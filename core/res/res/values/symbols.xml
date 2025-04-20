@@ -5589,4 +5589,6 @@
   <java-symbol type="drawable" name="ic_zen_mode_type_theater" />
   <java-symbol type="drawable" name="ic_zen_mode_type_unknown" />
 
+  <!--Secondary light sensor -->
+  <java-symbol type="array" name="config_secondaryLightSensorStringTypes"/>
 </resources>
