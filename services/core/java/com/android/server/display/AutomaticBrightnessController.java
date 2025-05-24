@@ -63,6 +63,7 @@ import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
@@ -293,6 +294,21 @@ public class AutomaticBrightnessController {
     private final DisplayManagerFlags mDisplayManagerFlags;
 
     private boolean mAutoBrightnessOneShot;
+
+    private static final float PROCESS_NOISE = 0.1f;
+    private static final float MEASUREMENT_NOISE_FRONT = 2.0f;
+    private static final float MEASUREMENT_NOISE_BACK = 1.0f;
+    private static final float INITIAL_ESTIMATE_ERROR = 1.0f;
+    
+    private static final float SCREEN_FEEDBACK_THRESHOLD = 50f;
+    private static final float SCREEN_FEEDBACK_DECAY = 0.8f;
+    private float mLastScreenBrightness = -1;
+    
+    private KalmanFilter mLightFilter;
+    private float mFrontSensorConfidence = 1.0f;
+    private float mBackSensorConfidence = 1.0f;
+    
+    private final ConcurrentHashMap<String, Float> mSensorValues = new ConcurrentHashMap<>();
 
     AutomaticBrightnessController(Callbacks callbacks, Looper looper,
             SensorManager sensorManager, Sensor lightSensor, List<Sensor> secondaryLightSensorList,
@@ -800,9 +816,55 @@ public class AutomaticBrightnessController {
         if (mAmbientLightRingBuffer.size() == 0) {
             // switch to using the steady-state sample rate after grabbing the initial light sample
             adjustLightSensorRate(mNormalLightSensorRate);
+            // Initialize the light filter with the first sensor reading
+            mLightFilter = new KalmanFilter(lux, INITIAL_ESTIMATE_ERROR, PROCESS_NOISE);
         }
-        applyLightSensorMeasurement(time, lux);
+
+        float measuredBrightnessDelta = Math.abs(mScreenAutoBrightness - mLastScreenBrightness);
+        if (measuredBrightnessDelta > SCREEN_FEEDBACK_THRESHOLD) {
+            mFrontSensorConfidence *= SCREEN_FEEDBACK_DECAY;
+        } else {
+            mFrontSensorConfidence = Math.min(1.0f, mFrontSensorConfidence + 0.1f);
+        }
+        mLastScreenBrightness = mScreenAutoBrightness;
+
+        float frontLux = 0f;
+        float backLux = 0f;
+        float frontWeight = 0f;
+        float backWeight = 0f;
+
+        for (Map.Entry<String, Float> entry : mSensorValues.entrySet()) {
+            if (mLightSensor != null && entry.getKey().equals(mLightSensor.getName())) {
+                frontLux = mLightFilter.update(entry.getValue(), 
+                    MEASUREMENT_NOISE_FRONT / mFrontSensorConfidence);
+                frontWeight = mFrontSensorConfidence;
+            } else if (mSecondaryLightSensorList != null && 
+                      mSecondaryLightSensorList.stream()
+                          .anyMatch(s -> s.getName().equals(entry.getKey()))) {
+                backLux = mLightFilter.update(entry.getValue(), MEASUREMENT_NOISE_BACK);
+                backWeight = mBackSensorConfidence;
+            }
+        }
+
+        float totalWeight = frontWeight + backWeight;
+        float fusedLux = 0f;
+        if (totalWeight > 0) {
+            fusedLux = (frontLux * frontWeight + backLux * backWeight) / totalWeight;
+        } else {
+            fusedLux = mLightFilter.getEstimate();
+        }
+
+        applyLightSensorMeasurement(time, fusedLux);
         updateAmbientLux(time);
+
+        if (mLoggingEnabled) {
+            Slog.d(TAG, "handleLightSensorEvent: time=" + time + 
+                " frontLux=" + frontLux + 
+                " backLux=" + backLux +
+                " fusedLux=" + fusedLux +
+                " frontConfidence=" + mFrontSensorConfidence +
+                " backConfidence=" + mBackSensorConfidence);
+        }
     }
 
     private void applyLightSensorMeasurement(long time, float lux) {
@@ -1473,9 +1535,6 @@ public class AutomaticBrightnessController {
     }
 
     private final SensorEventListener mLightSensorListener = new SensorEventListener() {
-
-        private final ConcurrentHashMap<String, Float> mSensorValues = new ConcurrentHashMap<>();
-
         @Override
         public void onSensorChanged(SensorEvent event) {
             if (mLightSensorEnabled) {
@@ -1483,8 +1542,7 @@ public class AutomaticBrightnessController {
                 final long time = (mDisplayManagerFlags.offloadControlsDozeAutoBrightness())
                         ? TimeUnit.NANOSECONDS.toMillis(event.timestamp) : mClock.uptimeMillis();
                 mSensorValues.put(event.sensor.getName(), event.values[0]);
-                final float maxLux = mSensorValues.values().stream().max(Float::compare).orElse(0.0f);
-                handleLightSensorEvent(time, maxLux);
+                handleLightSensorEvent(time, event.values[0]);
             }
         }
 
@@ -1719,6 +1777,62 @@ public class AutomaticBrightnessController {
 
         Clock createClock(boolean offloadControlsDozeBrightness) {
             return new RealClock(offloadControlsDozeBrightness);
+        }
+    }
+
+    private static class KalmanFilter {
+        private float estimate;
+        private float estimateError;
+        private final float processNoise;
+        private float lastScreenBrightness;
+        private boolean isInitialized;
+        
+        public KalmanFilter(float initialValue, float initialError, float processNoise) {
+            this.estimate = initialValue;
+            this.estimateError = initialError;
+            this.processNoise = processNoise;
+            this.lastScreenBrightness = -1;
+            this.isInitialized = false;
+        }
+
+        private boolean isScreenBrightnessJump(float currentBrightness) {
+            if (lastScreenBrightness < 0) {
+                lastScreenBrightness = currentBrightness;
+                return false;
+            }
+            boolean isJump = Math.abs(currentBrightness - lastScreenBrightness) > 0.2f;
+            lastScreenBrightness = currentBrightness;
+            return isJump;
+        }
+        
+        public float update(float measurement, float measurementNoise) {
+            if (isInitialized && isScreenBrightnessJump(measurement)) {
+                measurementNoise *= 2.0f;
+            }
+            
+            if (!isInitialized) {
+                estimate = measurement;
+                estimateError = measurementNoise;
+                isInitialized = true;
+                return estimate;
+            }
+
+            estimateError = estimateError + processNoise;
+            
+            float kalmanGain = estimateError / (estimateError + measurementNoise);
+            estimate = estimate + kalmanGain * (measurement - estimate);
+            estimateError = (1 - kalmanGain) * estimateError;
+            
+            return estimate;
+        }
+        
+        public float getEstimate() {
+            return estimate;
+        }
+        
+        public void reset() {
+            isInitialized = false;
+            lastScreenBrightness = -1;
         }
     }
 }
