@@ -1475,16 +1475,45 @@ public class AutomaticBrightnessController {
     private final SensorEventListener mLightSensorListener = new SensorEventListener() {
 
         private final ConcurrentHashMap<String, Float> mSensorValues = new ConcurrentHashMap<>();
+        private static final float MAIN_SENSOR_WEIGHT = 0.7f;
+        private static final float SECONDARY_SENSOR_WEIGHT = 0.3f;
+        private static final String FRONT_SENSOR_KEYWORD = "front";
 
         @Override
         public void onSensorChanged(SensorEvent event) {
             if (mLightSensorEnabled) {
-                // The time received from the sensor is in nano seconds, hence changing it to ms
                 final long time = (mDisplayManagerFlags.offloadControlsDozeAutoBrightness())
                         ? TimeUnit.NANOSECONDS.toMillis(event.timestamp) : mClock.uptimeMillis();
                 mSensorValues.put(event.sensor.getName(), event.values[0]);
-                final float maxLux = mSensorValues.values().stream().max(Float::compare).orElse(0.0f);
-                handleLightSensorEvent(time, maxLux);
+
+                float mainLux = 0f;
+                float secondaryLux = 0f;
+                boolean hasMain = false, hasSecondary = false;
+                for (String name : mSensorValues.keySet()) {
+                    float lux = mSensorValues.get(name);
+                    if (name.toLowerCase().contains(FRONT_SENSOR_KEYWORD)) {
+                        secondaryLux = lux;
+                        hasSecondary = true;
+                    } else {
+                        mainLux = lux;
+                        hasMain = true;
+                    }
+                }
+                float fusedLux;
+                if (hasMain && hasSecondary) {
+                    if ((mainLux > 10 && secondaryLux > 10) || (mainLux <= 10 && secondaryLux <= 10)) {
+                        fusedLux = mainLux * MAIN_SENSOR_WEIGHT + secondaryLux * SECONDARY_SENSOR_WEIGHT;
+                    } else {
+                        fusedLux = mainLux;
+                    }
+                } else if (hasMain) {
+                    fusedLux = mainLux;
+                } else if (hasSecondary) {
+                    fusedLux = secondaryLux;
+                } else {
+                    fusedLux = 0f;
+                }
+                handleLightSensorEvent(time, fusedLux);
             }
         }
 
